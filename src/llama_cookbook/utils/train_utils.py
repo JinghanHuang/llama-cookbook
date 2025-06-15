@@ -92,7 +92,10 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
 
-
+    # Dictionary to store previous activations and gradients on CPU
+    prev_activations = {}
+    prev_gradients = {}
+    is_first_iteration = True
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
     train_prep = []
@@ -148,8 +151,43 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 batch[key] = batch[key].to('xpu:0')
                             elif torch.cuda.is_available():
                                 batch[key] = batch[key].to('cuda:0')
+                    
+                    # Forward pass with activation tracking
                     with autocast():
+                        # Register hooks to capture activations
+                        current_activations = {}
+                        def hook_fn(name):
+                            def hook(module, input, output):
+                                # Immediately move activation to CPU to save GPU memory
+                                current_activations[name] = output.detach().cpu()
+                            return hook
+                        
+                        hooks = []
+                        for name, module in model.named_modules():
+                            if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm)):
+                                hooks.append(module.register_forward_hook(hook_fn(name)))
+                        
+                        # Forward pass
                         loss = model(**batch).loss
+                        
+                        # Remove hooks
+                        for hook in hooks:
+                            hook.remove()
+                        
+                        # Modify activations if not first iteration
+                        if not is_first_iteration:
+                            with torch.no_grad():
+                                for name, act_cpu in current_activations.items():
+                                    if name in prev_activations:
+                                        # All operations on CPU
+                                        act_cpu = act_cpu - prev_activations[name]
+                                        act_cpu = act_cpu + prev_activations[name]
+                                        current_activations[name] = act_cpu
+                        
+                        # Store current activations on CPU for next iteration
+                        prev_activations = current_activations
+                        is_first_iteration = False
+                    
                     total_loss += loss.detach().float()
                     loss = loss / gradient_accumulation_steps
                     if train_config.save_metrics:
@@ -158,6 +196,31 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     if train_config.use_fp16:
                         # if fp16 is enabled, use gradient scaler to handle gradient update
                         scaler.scale(loss).backward()
+                        
+                        # Modify gradients if not first iteration
+                        if not is_first_iteration:
+                            with torch.no_grad():
+                                for name, param in model.named_parameters():
+                                    if param.grad is not None and name in prev_gradients:
+                                        # Move current gradient to CPU
+                                        grad_cpu = param.grad.detach().cpu()
+                                        # Clear GPU memory
+                                        param.grad = None
+                                        
+                                        # All operations on CPU
+                                        grad_cpu = grad_cpu - prev_gradients[name]
+                                        grad_cpu = grad_cpu + prev_gradients[name]
+                                        
+                                        # Store on CPU
+                                        prev_gradients[name] = grad_cpu
+                                        
+                                        # Move back to GPU only when needed
+                                        param.grad = grad_cpu.to(param.device)
+                                    elif param.grad is not None:
+                                        # Store gradient on CPU and clear GPU memory
+                                        prev_gradients[name] = param.grad.detach().cpu()
+                                        param.grad = None
+                        
                         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                             if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
                                 scaler.unscale_(optimizer)
@@ -172,6 +235,31 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     else:
                         # regular backpropagation when fp16 is not used
                         loss.backward()
+                        
+                        # Modify gradients if not first iteration
+                        if not is_first_iteration:
+                            with torch.no_grad():
+                                for name, param in model.named_parameters():
+                                    if param.grad is not None and name in prev_gradients:
+                                        # Move current gradient to CPU
+                                        grad_cpu = param.grad.detach().cpu()
+                                        # Clear GPU memory
+                                        param.grad = None
+                                        
+                                        # All operations on CPU
+                                        grad_cpu = grad_cpu - prev_gradients[name]
+                                        grad_cpu = grad_cpu + prev_gradients[name]
+                                        
+                                        # Store on CPU
+                                        prev_gradients[name] = grad_cpu
+                                        
+                                        # Move back to GPU only when needed
+                                        param.grad = grad_cpu.to(param.device)
+                                    elif param.grad is not None:
+                                        # Store gradient on CPU and clear GPU memory
+                                        prev_gradients[name] = param.grad.detach().cpu()
+                                        param.grad = None
+                        
                         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                             if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
                                 if train_config.enable_fsdp:
