@@ -84,6 +84,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
     Returns: results dictionary containing average training and validation perplexity and loss
     """
+    # Enable CPU optimizations
+    torch.set_num_threads(os.cpu_count())  # Use all available CPU cores
+    torch.set_num_interop_threads(os.cpu_count())  # Use all available CPU cores for inter-op parallelism
+    
+    # Enable AVX if available
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')  # Enable AVX for matrix multiplication
+    
     # Create a gradient scaler for fp16
     if train_config.use_fp16 and train_config.enable_fsdp:
         scaler = ShardedGradScaler()
@@ -96,6 +104,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     prev_activations = {}
     prev_gradients = {}
     is_first_iteration = True
+
+    # Create pinned memory tensors for faster CPU-GPU transfer
+    pinned_activations = {}
+    pinned_gradients = {}
+
+    # Create thread pool for parallel CPU operations
+    from concurrent.futures import ThreadPoolExecutor
+    cpu_thread_pool = ThreadPoolExecutor(max_workers=os.cpu_count())
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
     train_prep = []
@@ -156,16 +172,25 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     with autocast():
                         # Register hooks to capture activations
                         current_activations = {}
-                        def hook_fn(name):
-                            def hook(module, input, output):
-                                # Immediately move activation to CPU to save GPU memory
-                                current_activations[name] = output.detach().cpu()
-                            return hook
+                        def hook(module, input, output):
+                            if not isinstance(output, torch.Tensor):
+                                return
+                            name = f"{module.__class__.__name__}"
+                            cpu_output = output.detach().cpu()
+                            
+                            # Check if we need to recreate the pinned tensor due to size mismatch
+                            if name not in pinned_activations or pinned_activations[name].size() != cpu_output.size():
+                                # Create new pinned tensor with correct size
+                                pinned_activations[name] = torch.empty_like(cpu_output, pin_memory=True)
+                            
+                            # Copy data to pinned memory
+                            pinned_activations[name].copy_(cpu_output)
+                            current_activations[name] = pinned_activations[name]
                         
                         hooks = []
                         for name, module in model.named_modules():
                             if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm)):
-                                hooks.append(module.register_forward_hook(hook_fn(name)))
+                                hooks.append(module.register_forward_hook(hook))
                         
                         # Forward pass
                         loss = model(**batch).loss
@@ -177,15 +202,24 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         # Modify activations if not first iteration
                         if not is_first_iteration:
                             with torch.no_grad():
-                                for name, act_cpu in current_activations.items():
+                                # Parallel process activations on CPU
+                                def process_activation(name_act):
+                                    name, act_cpu = name_act
                                     if name in prev_activations:
-                                        # All operations on CPU
-                                        act_cpu = act_cpu - prev_activations[name]
-                                        act_cpu = act_cpu + prev_activations[name]
-                                        current_activations[name] = act_cpu
+                                        # Vectorized operations on CPU with AVX
+                                        act_cpu.sub_(prev_activations[name])
+                                        act_cpu.add_(prev_activations[name])
+                                    return name, act_cpu
+                                
+                                # Process activations in parallel
+                                processed_acts = list(cpu_thread_pool.map(
+                                    process_activation, 
+                                    current_activations.items()
+                                ))
+                                current_activations = dict(processed_acts)
                         
                         # Store current activations on CPU for next iteration
-                        prev_activations = current_activations
+                        prev_activations = {name: act.clone() for name, act in current_activations.items()}
                         is_first_iteration = False
                     
                     total_loss += loss.detach().float()
@@ -200,24 +234,37 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         # Modify gradients if not first iteration
                         if not is_first_iteration:
                             with torch.no_grad():
+                                # Batch process gradients
+                                grads_to_process = []
                                 for name, param in model.named_parameters():
                                     if param.grad is not None and name in prev_gradients:
-                                        # Move current gradient to CPU
-                                        grad_cpu = param.grad.detach().cpu()
-                                        # Clear GPU memory
+                                        # Use asynchronous transfer to CPU with pinned memory
+                                        if name not in pinned_gradients:
+                                            pinned_gradients[name] = torch.empty_like(param.grad, pin_memory=True)
+                                        pinned_gradients[name].copy_(param.grad.detach(), non_blocking=True)
+                                        grads_to_process.append((name, param, pinned_gradients[name]))
                                         param.grad = None
-                                        
-                                        # All operations on CPU
-                                        grad_cpu = grad_cpu - prev_gradients[name]
-                                        grad_cpu = grad_cpu + prev_gradients[name]
-                                        
-                                        # Store on CPU
-                                        prev_gradients[name] = grad_cpu
-                                        
-                                        # Move back to GPU only when needed
-                                        param.grad = grad_cpu.to(param.device)
-                                    elif param.grad is not None:
-                                        # Store gradient on CPU and clear GPU memory
+                                
+                                # Process gradients in parallel on CPU
+                                def process_gradient(grad_info):
+                                    name, param, grad_cpu = grad_info
+                                    # Vectorized operations on CPU with AVX
+                                    grad_cpu.sub_(prev_gradients[name])
+                                    grad_cpu.add_(prev_gradients[name])
+                                    prev_gradients[name] = grad_cpu.clone()
+                                    # Move back to GPU asynchronously
+                                    param.grad = grad_cpu.to(param.device, non_blocking=True)
+                                    return name, param, grad_cpu
+                                
+                                # Process gradients in parallel
+                                processed_grads = list(cpu_thread_pool.map(
+                                    process_gradient,
+                                    grads_to_process
+                                ))
+                                
+                                # Store gradients on CPU and clear GPU memory
+                                for name, param, grad_cpu in processed_grads:
+                                    if param.grad is not None:
                                         prev_gradients[name] = param.grad.detach().cpu()
                                         param.grad = None
                         
@@ -239,24 +286,37 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         # Modify gradients if not first iteration
                         if not is_first_iteration:
                             with torch.no_grad():
+                                # Batch process gradients
+                                grads_to_process = []
                                 for name, param in model.named_parameters():
                                     if param.grad is not None and name in prev_gradients:
-                                        # Move current gradient to CPU
-                                        grad_cpu = param.grad.detach().cpu()
-                                        # Clear GPU memory
+                                        # Use asynchronous transfer to CPU with pinned memory
+                                        if name not in pinned_gradients:
+                                            pinned_gradients[name] = torch.empty_like(param.grad, pin_memory=True)
+                                        pinned_gradients[name].copy_(param.grad.detach(), non_blocking=True)
+                                        grads_to_process.append((name, param, pinned_gradients[name]))
                                         param.grad = None
-                                        
-                                        # All operations on CPU
-                                        grad_cpu = grad_cpu - prev_gradients[name]
-                                        grad_cpu = grad_cpu + prev_gradients[name]
-                                        
-                                        # Store on CPU
-                                        prev_gradients[name] = grad_cpu
-                                        
-                                        # Move back to GPU only when needed
-                                        param.grad = grad_cpu.to(param.device)
-                                    elif param.grad is not None:
-                                        # Store gradient on CPU and clear GPU memory
+                                
+                                # Process gradients in parallel on CPU
+                                def process_gradient(grad_info):
+                                    name, param, grad_cpu = grad_info
+                                    # Vectorized operations on CPU with AVX
+                                    grad_cpu.sub_(prev_gradients[name])
+                                    grad_cpu.add_(prev_gradients[name])
+                                    prev_gradients[name] = grad_cpu.clone()
+                                    # Move back to GPU asynchronously
+                                    param.grad = grad_cpu.to(param.device, non_blocking=True)
+                                    return name, param, grad_cpu
+                                
+                                # Process gradients in parallel
+                                processed_grads = list(cpu_thread_pool.map(
+                                    process_gradient,
+                                    grads_to_process
+                                ))
+                                
+                                # Store gradients on CPU and clear GPU memory
+                                for name, param, grad_cpu in processed_grads:
+                                    if param.grad is not None:
                                         prev_gradients[name] = param.grad.detach().cpu()
                                         param.grad = None
                         
