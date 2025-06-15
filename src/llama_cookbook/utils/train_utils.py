@@ -69,13 +69,14 @@ def profile(cfg, local_rank=None):
 def apply_topk_compression(tensor, compression_ratio):
     """
     Apply topK compression to a tensor by keeping only the top K% values and zeroing out the rest.
+    Memory efficient version that processes tensor in chunks.
     
     Args:
         tensor: Input tensor to compress
         compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
         
     Returns:
-        Compressed tensor with same shape as input
+        Compressed tensor (modified in-place)
     """
     if compression_ratio >= 1.0:
         return tensor
@@ -84,57 +85,88 @@ def apply_topk_compression(tensor, compression_ratio):
     total_elements = tensor.numel()
     k = int(total_elements * compression_ratio)
     
-    # Get top k values and their indices
-    values, indices = torch.topk(tensor.abs().view(-1), k)
+    # Process tensor in chunks to save memory
+    chunk_size = 1024 * 1024  # 1M elements per chunk
+    num_chunks = (total_elements + chunk_size - 1) // chunk_size
     
-    # Create a new tensor of zeros
-    compressed = torch.zeros_like(tensor.view(-1))
+    # Calculate k per chunk
+    k_per_chunk = (k + num_chunks - 1) // num_chunks
     
-    # Put back the top k values
-    compressed[indices] = tensor.view(-1)[indices]
+    # Process each chunk
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, total_elements)
+        
+        # Get chunk
+        chunk = tensor.view(-1)[start_idx:end_idx]
+        
+        # Get top k values for this chunk
+        with torch.cuda.amp.autocast(enabled=True):
+            values, indices = torch.topk(chunk.abs(), min(k_per_chunk, end_idx - start_idx))
+            
+            # Create mask for this chunk
+            mask = torch.zeros_like(chunk, dtype=torch.bool, device=tensor.device)
+            mask[indices] = True
+            
+            # Apply mask in-place
+            chunk[~mask] = 0
     
-    # Reshape back to original shape
-    return compressed.view(tensor.shape)
+    return tensor
 
-def compress_activations(model, compression_ratio):
+def apply_activation_compression(model, compression_ratio, rank=None):
     """
     Apply topK compression to model activations.
+    Memory efficient version that processes tensor in chunks.
     
     Args:
         model: The model whose activations to compress
         compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
+        rank: Current process rank for distributed training
     """
     def hook_fn(module, input, output):
         if isinstance(output, torch.Tensor):
-            return apply_topk_compression(output, compression_ratio)
+            # Only compress if tensor is large enough to benefit from compression
+            if output.numel() > 1000:  # Skip small tensors
+                return apply_topk_compression(output, compression_ratio)
         return output
     
     # Register hooks for all modules
     hooks = []
-    for module in model.modules():
+    for name, module in model.named_modules():
         if hasattr(module, 'forward'):
             hook = module.register_forward_hook(hook_fn)
             hooks.append(hook)
+            if rank == 0:
+                print(f"Registered activation compression hook for {name}")
     
     return hooks
 
-def compress_gradients(model, compression_ratio):
+def apply_gradient_compression(model, compression_ratio, rank=None):
     """
     Apply topK compression to model gradients.
+    Memory efficient version that processes tensor in chunks.
     
     Args:
         model: The model whose gradients to compress
         compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
+        rank: Current process rank for distributed training
     """
     def hook_fn(grad):
-        return apply_topk_compression(grad, compression_ratio)
+        if grad is None:
+            return grad
+        # Only compress if tensor is large enough to benefit from compression
+        if grad.numel() > 1000:  # Skip small tensors
+            return apply_topk_compression(grad, compression_ratio)
+        return grad
     
     # Register hooks for all parameters
     hooks = []
-    for param in model.parameters():
+    for name, param in model.named_parameters():
         if param.requires_grad:
             hook = param.register_hook(hook_fn)
             hooks.append(hook)
+            if rank == 0:
+                print(f"Registered gradient compression hook for {name}")
     
     return hooks
 
@@ -166,20 +198,26 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
     # Setup compression hooks if enabled
     compression_hooks = []
-    if hasattr(train_config, 'use_compression') and train_config.use_compression:
-        # Set default compression ratio to 0.36 (36%) if not specified
-        compression_ratio = getattr(train_config, 'compression_ratio', 0.36)
-        
-        # By default only compress gradients if not specified
-        compress_activations = getattr(train_config, 'compress_activations', True)
-        compress_gradients = getattr(train_config, 'compress_gradients', True)
+    
+    # Set default compression settings if not specified
+    use_compression = getattr(train_config, 'use_compression', True)  # Default to True
+    compression_ratio = getattr(train_config, 'compression_ratio', 0.36)  # Default to 36%
+    compress_activations = getattr(train_config, 'compress_activations', True)  # Default to True
+    compress_gradients = getattr(train_config, 'compress_gradients', True)  # Default to True
+    
+    if use_compression:
+        if rank == 0:
+            print(f"\nCompression Configuration:")
+            print(f"Compression ratio: {compression_ratio}")
+            print(f"Activation compression: {compress_activations}")
+            print(f"Gradient compression: {compress_gradients}\n")
         
         if compress_activations:
-            activation_hooks = compress_activations(model, compression_ratio)
+            activation_hooks = apply_activation_compression(model, compression_ratio, rank)
             compression_hooks.extend(activation_hooks)
         
         if compress_gradients:
-            gradient_hooks = compress_gradients(model, compression_ratio)
+            gradient_hooks = apply_gradient_compression(model, compression_ratio, rank)
             compression_hooks.extend(gradient_hooks)
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
@@ -285,6 +323,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
                     if train_config.save_metrics:
                         save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
+
                 pbar.close()
 
         epoch_end_time = time.perf_counter()-epoch_start_time
@@ -409,6 +448,33 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     #saving the training params including fsdp setting for reference.
     if train_config.enable_fsdp and not train_config.use_peft and rank==0:
         save_train_params(train_config, fsdp_config, rank)
+
+    # Add compression metrics to results
+    if train_config.use_compression:
+        act_metrics = [m for m in compression_hooks if 'module_name' in m]
+        grad_metrics = [m for m in compression_hooks if 'param_name' in m]
+        
+        results['compression_metrics'] = {
+            'compression_ratio': compression_ratio,
+            'compress_activations': compress_activations,
+            'compress_gradients': compress_gradients
+        }
+        
+        if act_metrics:
+            results['compression_metrics'].update({
+                'activation_sparsity': sum(m['sparsity'] for m in act_metrics) / len(act_metrics),
+                'activation_norm_ratio': sum(m['compressed_norm'] / m['original_norm'] for m in act_metrics) / len(act_metrics)
+            })
+        
+        if grad_metrics:
+            results['compression_metrics'].update({
+                'gradient_sparsity': sum(m['sparsity'] for m in grad_metrics) / len(grad_metrics),
+                'gradient_norm_ratio': sum(m['compressed_norm'] / m['original_norm'] for m in grad_metrics) / len(grad_metrics)
+            })
+
+    # Clean up compression hooks at the end of training
+    for hook in compression_hooks:
+        hook.remove()
 
     return results
 
