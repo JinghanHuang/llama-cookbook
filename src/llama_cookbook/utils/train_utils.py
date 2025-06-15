@@ -18,6 +18,10 @@ from tqdm import tqdm
 from transformers import LlamaTokenizer
 import json
 import torch.nn.functional as F
+import torch.multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+from numba import jit
 
 
 from llama_cookbook.model_checkpointing import save_fsdp_model_checkpoint_full, save_model_and_optimizer_sharded, save_optimizer_checkpoint, save_peft_checkpoint, save_model_checkpoint
@@ -66,10 +70,37 @@ def profile(cfg, local_rank=None):
         torch_profiler = contextlib.nullcontext()
         yield None
 
+@jit(nopython=True, parallel=True)
+def process_chunk_numba(chunk_np, k):
+    """Process a single chunk using Numba for faster CPU computation"""
+    # Get absolute values
+    abs_vals = np.abs(chunk_np)
+    # Use partition for better performance than full sort
+    threshold = np.partition(abs_vals, -k)[-k]
+    # Create and apply mask in one step
+    chunk_np[abs_vals < threshold] = 0
+    return chunk_np
+
+def process_chunk(args):
+    """Process a single chunk on CPU with numpy for better performance"""
+    chunk, k_per_chunk = args
+    # Convert to float32 for numpy compatibility
+    chunk_np = chunk.float().numpy()
+    # Get top k values using numpy's partition
+    k = min(k_per_chunk, len(chunk_np))
+    # Use partition for better performance than full sort
+    threshold = np.partition(np.abs(chunk_np), -k)[-k]
+    # Create mask
+    mask = np.abs(chunk_np) >= threshold
+    # Apply mask
+    chunk_np[~mask] = 0
+    # Convert back to original dtype
+    return torch.from_numpy(chunk_np).to(chunk.dtype)
+
 def apply_topk_compression(tensor, compression_ratio):
     """
     Apply topK compression to a tensor by keeping only the top K% values and zeroing out the rest.
-    Memory efficient version that processes tensor in chunks.
+    CPU-optimized version with multi-threading.
     
     Args:
         tensor: Input tensor to compress
@@ -92,31 +123,37 @@ def apply_topk_compression(tensor, compression_ratio):
     # Calculate k per chunk
     k_per_chunk = (k + num_chunks - 1) // num_chunks
     
-    # Process each chunk
+    # Move tensor to CPU for processing
+    tensor_cpu = tensor.detach().cpu()
+    
+    # Prepare chunks for parallel processing
+    chunks = []
     for i in range(num_chunks):
         start_idx = i * chunk_size
         end_idx = min((i + 1) * chunk_size, total_elements)
-        
-        # Get chunk
-        chunk = tensor.view(-1)[start_idx:end_idx]
-        
-        # Get top k values for this chunk
-        with torch.cuda.amp.autocast(enabled=True):
-            values, indices = torch.topk(chunk.abs(), min(k_per_chunk, end_idx - start_idx))
-            
-            # Create mask for this chunk
-            mask = torch.zeros_like(chunk, dtype=torch.bool, device=tensor.device)
-            mask[indices] = True
-            
-            # Apply mask in-place
-            chunk[~mask] = 0
+        chunk = tensor_cpu.view(-1)[start_idx:end_idx]
+        chunks.append((chunk, k_per_chunk))
+    
+    # Process chunks in parallel using ThreadPoolExecutor
+    num_workers = min(mp.cpu_count(), num_chunks)  # Use available CPU cores
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(process_chunk, chunks))
+    
+    # Combine results back into tensor
+    for i, result in enumerate(results):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, total_elements)
+        tensor_cpu.view(-1)[start_idx:end_idx].copy_(result)
+    
+    # Copy back to GPU
+    tensor.copy_(tensor_cpu.to(tensor.device))
     
     return tensor
 
 def apply_activation_compression(model, compression_ratio, rank=None):
     """
     Apply topK compression to model activations.
-    Memory efficient version that processes tensor in chunks.
+    CPU-optimized version with multi-threading.
     
     Args:
         model: The model whose activations to compress
@@ -144,7 +181,7 @@ def apply_activation_compression(model, compression_ratio, rank=None):
 def apply_gradient_compression(model, compression_ratio, rank=None):
     """
     Apply topK compression to model gradients.
-    Memory efficient version that processes tensor in chunks.
+    CPU-optimized version with multi-threading.
     
     Args:
         model: The model whose gradients to compress
