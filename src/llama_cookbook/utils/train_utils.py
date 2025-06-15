@@ -24,6 +24,77 @@ from llama_cookbook.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_cookbook.utils.memory_utils import MemoryTrace
 from accelerate.utils import is_xpu_available, is_ccl_available
 from llama_cookbook.utils.flop_utils import FlopMeasure
+from llama_cookbook.utils.config_utils import save_train_params
+from llama_cookbook.utils.distributed_utils import is_xpu_available
+
+class ActivationGradientNormalizer:
+    def __init__(self, model, percentile=99):
+        self.model = model
+        self.percentile = percentile
+        self.activation_hooks = []
+        self.gradient_hooks = []
+        self.layer_activation_mins = {}
+        self.layer_gradient_mins = {}
+        self.iteration = 0
+        self._register_hooks()
+        
+    def _register_hooks(self):
+        def get_activation_hook(name):
+            def hook(module, input, output):
+                if self.iteration >= 1:  # Start from 2nd iteration
+                    if isinstance(output, torch.Tensor):
+                        with torch.no_grad():
+                            # Calculate 99th percentile minimum
+                            min_val = torch.quantile(output.detach().flatten(), (100 - self.percentile) / 100)
+                            if name not in self.layer_activation_mins:
+                                self.layer_activation_mins[name] = min_val
+                            else:
+                                # Update min value with exponential moving average
+                                self.layer_activation_mins[name] = 0.9 * self.layer_activation_mins[name] + 0.1 * min_val
+                            
+                            # Normalize activation
+                            output = output - self.layer_activation_mins[name] + self.layer_activation_mins[name]
+            return hook
+
+        def get_gradient_hook(name):
+            def hook(grad):
+                if self.iteration >= 1:  # Start from 2nd iteration
+                    if grad is not None:
+                        with torch.no_grad():
+                            # Calculate 99th percentile minimum
+                            min_val = torch.quantile(grad.detach().flatten(), (100 - self.percentile) / 100)
+                            if name not in self.layer_gradient_mins:
+                                self.layer_gradient_mins[name] = min_val
+                            else:
+                                # Update min value with exponential moving average
+                                self.layer_gradient_mins[name] = 0.9 * self.layer_gradient_mins[name] + 0.1 * min_val
+                            
+                            # Normalize gradient
+                            grad = grad - self.layer_gradient_mins[name] + self.layer_gradient_mins[name]
+                return grad
+            return hook
+
+        # Register hooks for all layers
+        for name, module in self.model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                # Register forward hook for activations
+                hook = get_activation_hook(name)
+                self.activation_hooks.append(module.register_forward_hook(hook))
+                
+                # Register backward hook for gradients
+                if module.weight is not None:
+                    hook = get_gradient_hook(name)
+                    self.gradient_hooks.append(module.weight.register_hook(hook))
+
+    def step(self):
+        self.iteration += 1
+
+    def remove_hooks(self):
+        for hook in self.activation_hooks:
+            hook.remove()
+        for hook in self.gradient_hooks:
+            hook.remove()
+
 def set_tokenizer_params(tokenizer: LlamaTokenizer):
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
@@ -92,7 +163,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
 
-
+    # Initialize activation/gradient normalizer
+    normalizer = ActivationGradientNormalizer(model)
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
     train_prep = []
@@ -152,6 +224,10 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         loss = model(**batch).loss
                     total_loss += loss.detach().float()
                     loss = loss / gradient_accumulation_steps
+                    
+                    # Step the normalizer after forward pass
+                    normalizer.step()
+                    
                     if train_config.save_metrics:
                         train_step_loss.append(loss.detach().float().item())
                         train_step_perplexity.append(float(torch.exp(loss.detach().float())))
@@ -299,6 +375,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         if train_config.save_metrics:
             save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
 
+    # Clean up hooks
+    normalizer.remove_hooks()
+    
     avg_epoch_time = sum(epoch_times)/ len(epoch_times)
     avg_checkpoint_time = sum(checkpoint_times)/ len(checkpoint_times) if len(checkpoint_times) > 0 else 0
     avg_train_prep = sum(train_prep)/len(train_prep)
@@ -532,45 +611,6 @@ def print_frozen_model_status(model, config, rank: int = 0) -> None:
                 print(f"    {module}: Unfrozen")
         print("")
 
-
-def save_train_params(train_config, fsdp_config, rank):
-    """
-    This function saves the train_config and FSDP config into a train_params.yaml.
-    This will be used by converter script in the inference folder to fetch the HF model name or path.
-    It also would be hepful as a log for future references.
-    """
-    # Convert the train_config and fsdp_config objects to dictionaries,
-    # converting all values to strings to ensure they can be serialized into a YAML file
-    train_config_dict = {k: str(v) for k, v in vars(train_config).items() if not k.startswith('__')}
-    fsdp_config_dict = {k: str(v) for k, v in vars(fsdp_config).items() if not k.startswith('__')}
-    # Merge the two dictionaries into one
-    train_params_dict = {**train_config_dict, **fsdp_config_dict}
-    # Construct the folder name (following FSDP checkpointing style) using properties of the train_config object
-    folder_name = (
-    train_config.dist_checkpoint_root_folder
-    + "/"
-    + train_config.dist_checkpoint_folder
-    + "-"
-    + train_config.model_name
-    )
-
-    save_dir = Path.cwd() / folder_name
-    # If the directory does not exist, create it
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    # Convert the dictionary to a YAML string
-    config_yaml = yaml.dump(train_params_dict, indent=4)
-    file_name = os.path.join(save_dir,'train_params.yaml')
-
-    # Check if there's a directory with the same name as the file
-    if os.path.isdir(file_name):
-        print(f"Error: {file_name} is a directory, not a file.")
-    else:
-        # Write the YAML string to the file
-        with open(file_name, 'w') as f:
-            f.write(config_yaml)
-        if rank==0:
-            print(f"training params are saved in {file_name}")
 
 def save_to_json(output_filename, train_step_loss, train_epoch_loss, train_step_ppl, train_epoch_ppl, val_step_loss, val_epoch_loss, val_step_ppl, val_epoch_ppl):
     metrics_data = {
