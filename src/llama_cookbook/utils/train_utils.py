@@ -17,6 +17,7 @@ from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from tqdm import tqdm
 from transformers import LlamaTokenizer
 import json
+import torch.nn.functional as F
 
 
 from llama_cookbook.model_checkpointing import save_fsdp_model_checkpoint_full, save_model_and_optimizer_sharded, save_optimizer_checkpoint, save_peft_checkpoint, save_model_checkpoint
@@ -65,6 +66,77 @@ def profile(cfg, local_rank=None):
         torch_profiler = contextlib.nullcontext()
         yield None
 
+def apply_topk_compression(tensor, compression_ratio):
+    """
+    Apply topK compression to a tensor by keeping only the top K% values and zeroing out the rest.
+    
+    Args:
+        tensor: Input tensor to compress
+        compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
+        
+    Returns:
+        Compressed tensor with same shape as input
+    """
+    if compression_ratio >= 1.0:
+        return tensor
+        
+    # Calculate number of elements to keep
+    total_elements = tensor.numel()
+    k = int(total_elements * compression_ratio)
+    
+    # Get top k values and their indices
+    values, indices = torch.topk(tensor.abs().view(-1), k)
+    
+    # Create a new tensor of zeros
+    compressed = torch.zeros_like(tensor.view(-1))
+    
+    # Put back the top k values
+    compressed[indices] = tensor.view(-1)[indices]
+    
+    # Reshape back to original shape
+    return compressed.view(tensor.shape)
+
+def compress_activations(model, compression_ratio):
+    """
+    Apply topK compression to model activations.
+    
+    Args:
+        model: The model whose activations to compress
+        compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
+    """
+    def hook_fn(module, input, output):
+        if isinstance(output, torch.Tensor):
+            return apply_topk_compression(output, compression_ratio)
+        return output
+    
+    # Register hooks for all modules
+    hooks = []
+    for module in model.modules():
+        if hasattr(module, 'forward'):
+            hook = module.register_forward_hook(hook_fn)
+            hooks.append(hook)
+    
+    return hooks
+
+def compress_gradients(model, compression_ratio):
+    """
+    Apply topK compression to model gradients.
+    
+    Args:
+        model: The model whose gradients to compress
+        compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
+    """
+    def hook_fn(grad):
+        return apply_topk_compression(grad, compression_ratio)
+    
+    # Register hooks for all parameters
+    hooks = []
+    for param in model.parameters():
+        if param.requires_grad:
+            hook = param.register_hook(hook_fn)
+            hooks.append(hook)
+    
+    return hooks
 
 def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None):
     """
@@ -92,7 +164,23 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
 
-
+    # Setup compression hooks if enabled
+    compression_hooks = []
+    if hasattr(train_config, 'use_compression') and train_config.use_compression:
+        # Set default compression ratio to 0.36 (36%) if not specified
+        compression_ratio = getattr(train_config, 'compression_ratio', 0.36)
+        
+        # By default only compress gradients if not specified
+        compress_activations = getattr(train_config, 'compress_activations', True)
+        compress_gradients = getattr(train_config, 'compress_gradients', True)
+        
+        if compress_activations:
+            activation_hooks = compress_activations(model, compression_ratio)
+            compression_hooks.extend(activation_hooks)
+        
+        if compress_gradients:
+            gradient_hooks = compress_gradients(model, compression_ratio)
+            compression_hooks.extend(gradient_hooks)
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
     train_prep = []
