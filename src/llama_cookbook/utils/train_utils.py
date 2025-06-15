@@ -201,8 +201,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     
     # Set default compression settings if not specified
     use_compression = getattr(train_config, 'use_compression', True)  # Default to True
-    compression_ratio = getattr(train_config, 'compression_ratio', 0.36)  # Default to 36%
-    compress_activations = getattr(train_config, 'compress_activations', True)  # Default to True
+    compression_ratio = getattr(train_config, 'compression_ratio', 0.08)  # Default to 36%
+    compress_activations = getattr(train_config, 'compress_activations', False)  # Default to True
     compress_gradients = getattr(train_config, 'compress_gradients', True)  # Default to True
     
     if use_compression:
