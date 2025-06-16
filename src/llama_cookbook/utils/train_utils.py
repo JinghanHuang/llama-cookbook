@@ -65,6 +65,35 @@ def profile(cfg, local_rank=None):
         torch_profiler = contextlib.nullcontext()
         yield None
 
+def apply_topk_compression(tensor, keep_percentage=0.36):
+    """
+    Apply topK compression to a tensor, keeping only the top k% largest values.
+    
+    Args:
+        tensor: Input tensor to compress
+        keep_percentage: Percentage of values to keep (default 36%)
+    
+    Returns:
+        Compressed tensor with same shape as input
+    """
+    if tensor is None:
+        return None
+        
+    # Calculate number of elements to keep
+    num_elements = tensor.numel()
+    k = int(num_elements * keep_percentage)
+    
+    # Get top k values and their indices
+    values, indices = torch.topk(tensor.abs().flatten(), k)
+    
+    # Create zero tensor of same shape
+    compressed = torch.zeros_like(tensor.flatten())
+    
+    # Set top k values
+    compressed[indices] = tensor.flatten()[indices]
+    
+    # Reshape back to original shape
+    return compressed.reshape(tensor.shape)
 
 def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None):
     """
@@ -84,6 +113,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
     Returns: results dictionary containing average training and validation perplexity and loss
     """
+    # Set tokenizer parallelism to false to avoid deadlocks
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
     # Enable CPU optimizations
     torch.set_num_threads(os.cpu_count())  # Use all available CPU cores
     torch.set_num_interop_threads(os.cpu_count())  # Use all available CPU cores for inter-op parallelism
@@ -99,11 +131,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         scaler = torch.cuda.amp.GradScaler()
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
-
-    # Dictionary to store previous activations and gradients on CPU
-    prev_activations = {}
-    prev_gradients = {}
-    is_first_iteration = True
 
     # Create pinned memory tensors for faster CPU-GPU transfer
     pinned_activations = {}
@@ -134,6 +161,12 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     best_val_loss = float("inf")
     total_train_steps = 0
     max_steps_reached = False  # Flag to indicate max training steps reached
+    
+    # Get compression settings from config
+    compress_activations = getattr(train_config, 'compress_activations', True)
+    compress_gradients = getattr(train_config, 'compress_gradients', True)
+    compression_percentage = getattr(train_config, 'compression_percentage', 0.36)
+    
     # Start the training loop
     for epoch in range(train_config.num_epochs):
         print(f"Starting epoch {epoch}/{train_config.num_epochs}")
@@ -170,8 +203,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                     
                     # Forward pass with activation tracking
                     with autocast():
-                        # Register hooks to capture activations
-                        current_activations = {}
+                        # Register hooks to capture and compress activations
                         def hook(module, input, output):
                             if not isinstance(output, torch.Tensor):
                                 return
@@ -185,7 +217,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             
                             # Copy data to pinned memory
                             pinned_activations[name].copy_(cpu_output)
-                            current_activations[name] = pinned_activations[name]
+                            
+                            # Apply topK compression if enabled
+                            if compress_activations:
+                                compressed_output = apply_topk_compression(pinned_activations[name], compression_percentage)
+                                # Return compressed tensor
+                                return compressed_output.to(output.device)
+                            else:
+                                return output
                         
                         hooks = []
                         for name, module in model.named_modules():
@@ -198,46 +237,24 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         # Remove hooks
                         for hook in hooks:
                             hook.remove()
-                        
-                        # Modify activations if not first iteration
-                        if not is_first_iteration:
-                            with torch.no_grad():
-                                # Parallel process activations on CPU
-                                def process_activation(name_act):
-                                    name, act_cpu = name_act
-                                    if name in prev_activations:
-                                        # Vectorized operations on CPU with AVX
-                                        act_cpu.sub_(prev_activations[name])
-                                        act_cpu.add_(prev_activations[name])
-                                    return name, act_cpu
-                                
-                                # Process activations in parallel
-                                processed_acts = list(cpu_thread_pool.map(
-                                    process_activation, 
-                                    current_activations.items()
-                                ))
-                                current_activations = dict(processed_acts)
-                        
-                        # Store current activations on CPU for next iteration
-                        prev_activations = {name: act.clone() for name, act in current_activations.items()}
-                        is_first_iteration = False
                     
                     total_loss += loss.detach().float()
                     loss = loss / gradient_accumulation_steps
                     if train_config.save_metrics:
                         train_step_loss.append(loss.detach().float().item())
                         train_step_perplexity.append(float(torch.exp(loss.detach().float())))
+                    
                     if train_config.use_fp16:
                         # if fp16 is enabled, use gradient scaler to handle gradient update
                         scaler.scale(loss).backward()
                         
-                        # Modify gradients if not first iteration
-                        if not is_first_iteration:
+                        # Apply topK compression to gradients if enabled
+                        if compress_gradients:
                             with torch.no_grad():
                                 # Batch process gradients
                                 grads_to_process = []
                                 for name, param in model.named_parameters():
-                                    if param.grad is not None and name in prev_gradients:
+                                    if param.grad is not None:
                                         # Use asynchronous transfer to CPU with pinned memory
                                         if name not in pinned_gradients:
                                             pinned_gradients[name] = torch.empty_like(param.grad, pin_memory=True)
@@ -248,25 +265,17 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 # Process gradients in parallel on CPU
                                 def process_gradient(grad_info):
                                     name, param, grad_cpu = grad_info
-                                    # Vectorized operations on CPU with AVX
-                                    grad_cpu.sub_(prev_gradients[name])
-                                    grad_cpu.add_(prev_gradients[name])
-                                    prev_gradients[name] = grad_cpu.clone()
+                                    # Apply topK compression
+                                    compressed_grad = apply_topk_compression(grad_cpu, compression_percentage)
                                     # Move back to GPU asynchronously
-                                    param.grad = grad_cpu.to(param.device, non_blocking=True)
-                                    return name, param, grad_cpu
+                                    param.grad = compressed_grad.to(param.device, non_blocking=True)
+                                    return name, param, compressed_grad
                                 
                                 # Process gradients in parallel
                                 processed_grads = list(cpu_thread_pool.map(
                                     process_gradient,
                                     grads_to_process
                                 ))
-                                
-                                # Store gradients on CPU and clear GPU memory
-                                for name, param, grad_cpu in processed_grads:
-                                    if param.grad is not None:
-                                        prev_gradients[name] = param.grad.detach().cpu()
-                                        param.grad = None
                         
                         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                             if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
@@ -283,13 +292,13 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         # regular backpropagation when fp16 is not used
                         loss.backward()
                         
-                        # Modify gradients if not first iteration
-                        if not is_first_iteration:
+                        # Apply topK compression to gradients if enabled
+                        if compress_gradients:
                             with torch.no_grad():
                                 # Batch process gradients
                                 grads_to_process = []
                                 for name, param in model.named_parameters():
-                                    if param.grad is not None and name in prev_gradients:
+                                    if param.grad is not None:
                                         # Use asynchronous transfer to CPU with pinned memory
                                         if name not in pinned_gradients:
                                             pinned_gradients[name] = torch.empty_like(param.grad, pin_memory=True)
@@ -300,25 +309,17 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 # Process gradients in parallel on CPU
                                 def process_gradient(grad_info):
                                     name, param, grad_cpu = grad_info
-                                    # Vectorized operations on CPU with AVX
-                                    grad_cpu.sub_(prev_gradients[name])
-                                    grad_cpu.add_(prev_gradients[name])
-                                    prev_gradients[name] = grad_cpu.clone()
+                                    # Apply topK compression
+                                    compressed_grad = apply_topk_compression(grad_cpu, compression_percentage)
                                     # Move back to GPU asynchronously
-                                    param.grad = grad_cpu.to(param.device, non_blocking=True)
-                                    return name, param, grad_cpu
+                                    param.grad = compressed_grad.to(param.device, non_blocking=True)
+                                    return name, param, compressed_grad
                                 
                                 # Process gradients in parallel
                                 processed_grads = list(cpu_thread_pool.map(
                                     process_gradient,
                                     grads_to_process
                                 ))
-                                
-                                # Store gradients on CPU and clear GPU memory
-                                for name, param, grad_cpu in processed_grads:
-                                    if param.grad is not None:
-                                        prev_gradients[name] = param.grad.detach().cpu()
-                                        param.grad = None
                         
                         if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                             if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
