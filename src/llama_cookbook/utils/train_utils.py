@@ -83,9 +83,9 @@ def process_chunk_numba(chunk_np, k):
 
 def process_chunk(args):
     """Process a single chunk on CPU with numpy for better performance"""
-    chunk, k_per_chunk = args
+    input_chunk, output_chunk, k_per_chunk = args
     # Convert to float32 for numpy compatibility
-    chunk_np = chunk.float().numpy()
+    chunk_np = input_chunk.float().numpy()
     # Get top k values using numpy's partition
     k = min(k_per_chunk, len(chunk_np))
     # Use partition for better performance than full sort
@@ -94,20 +94,20 @@ def process_chunk(args):
     mask = np.abs(chunk_np) >= threshold
     # Apply mask
     chunk_np[~mask] = 0
-    # Convert back to original dtype
-    return torch.from_numpy(chunk_np).to(chunk.dtype)
+    # Copy to output chunk
+    output_chunk.copy_(torch.from_numpy(chunk_np).to(input_chunk.dtype))
 
 def apply_topk_compression(tensor, compression_ratio):
     """
     Apply topK compression to a tensor by keeping only the top K% values and zeroing out the rest.
-    CPU-optimized version with multi-threading.
+    Memory-efficient GPU-optimized version that preserves gradients and avoids in-place operations.
     
     Args:
         tensor: Input tensor to compress
         compression_ratio: Float between 0 and 1 indicating what percentage of values to keep
         
     Returns:
-        Compressed tensor (modified in-place)
+        Compressed tensor (new tensor with gradients)
     """
     if compression_ratio >= 1.0:
         return tensor
@@ -116,44 +116,53 @@ def apply_topk_compression(tensor, compression_ratio):
     total_elements = tensor.numel()
     k = int(total_elements * compression_ratio)
     
-    # Process tensor in chunks to save memory
+    # Process in smaller chunks to avoid OOM
     chunk_size = 1024 * 1024  # 1M elements per chunk
     num_chunks = (total_elements + chunk_size - 1) // chunk_size
-    
-    # Calculate k per chunk
     k_per_chunk = (k + num_chunks - 1) // num_chunks
     
-    # Move tensor to CPU for processing
-    tensor_cpu = tensor.detach().cpu()
+    # Create output tensor
+    output = torch.zeros_like(tensor)
+    tensor_flat = tensor.view(-1)
+    output_flat = output.view(-1)
     
-    # Prepare chunks for parallel processing
-    chunks = []
+    # Process each chunk
     for i in range(num_chunks):
         start_idx = i * chunk_size
         end_idx = min((i + 1) * chunk_size, total_elements)
-        chunk = tensor_cpu.view(-1)[start_idx:end_idx]
-        chunks.append((chunk, k_per_chunk))
+        
+        # Get chunk
+        chunk = tensor_flat[start_idx:end_idx]
+        
+        # Get top k values for this chunk
+        with torch.amp.autocast('cuda', enabled=True):
+            # Calculate k for this chunk
+            chunk_k = min(k_per_chunk, end_idx - start_idx)
+            
+            # Get top k values
+            values, indices = torch.topk(chunk.abs(), chunk_k)
+            
+            # Create mask for this chunk
+            chunk_mask = torch.zeros_like(chunk, dtype=torch.bool)
+            # Use scatter instead of scatter_ for non-in-place operation
+            chunk_mask = torch.scatter(chunk_mask, 0, indices, torch.ones_like(indices, dtype=torch.bool))
+            
+            # Apply mask to chunk
+            masked_chunk = chunk * chunk_mask
+            
+            # Update output (non-in-place)
+            output_flat = torch.cat([
+                output_flat[:start_idx],
+                masked_chunk,
+                output_flat[end_idx:]
+            ])
     
-    # Process chunks in parallel using ThreadPoolExecutor
-    num_workers = min(mp.cpu_count(), num_chunks)  # Use available CPU cores
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        results = list(executor.map(process_chunk, chunks))
-    
-    # Combine results back into tensor
-    for i, result in enumerate(results):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, total_elements)
-        tensor_cpu.view(-1)[start_idx:end_idx].copy_(result)
-    
-    # Copy back to GPU
-    tensor.copy_(tensor_cpu.to(tensor.device))
-    
-    return tensor
+    return output_flat.view_as(tensor)
 
 def apply_activation_compression(model, compression_ratio, rank=None):
     """
     Apply topK compression to model activations.
-    CPU-optimized version with multi-threading.
+    Memory-efficient GPU-optimized version that preserves gradients and avoids in-place operations.
     
     Args:
         model: The model whose activations to compress
@@ -164,7 +173,12 @@ def apply_activation_compression(model, compression_ratio, rank=None):
         if isinstance(output, torch.Tensor):
             # Only compress if tensor is large enough to benefit from compression
             if output.numel() > 1000:  # Skip small tensors
-                return apply_topk_compression(output, compression_ratio)
+                try:
+                    return apply_topk_compression(output, compression_ratio)
+                except torch.cuda.OutOfMemoryError:
+                    if rank == 0:
+                        print(f"Warning: OOM during activation compression for tensor of size {output.numel()}. Skipping compression.")
+                    return output
         return output
     
     # Register hooks for all modules
@@ -181,7 +195,7 @@ def apply_activation_compression(model, compression_ratio, rank=None):
 def apply_gradient_compression(model, compression_ratio, rank=None):
     """
     Apply topK compression to model gradients.
-    CPU-optimized version with multi-threading.
+    Memory-efficient GPU-optimized version that preserves gradients and avoids in-place operations.
     
     Args:
         model: The model whose gradients to compress
@@ -193,7 +207,12 @@ def apply_gradient_compression(model, compression_ratio, rank=None):
             return grad
         # Only compress if tensor is large enough to benefit from compression
         if grad.numel() > 1000:  # Skip small tensors
-            return apply_topk_compression(grad, compression_ratio)
+            try:
+                return apply_topk_compression(grad, compression_ratio)
+            except torch.cuda.OutOfMemoryError:
+                if rank == 0:
+                    print(f"Warning: OOM during gradient compression for tensor of size {grad.numel()}. Skipping compression.")
+                return grad
         return grad
     
     # Register hooks for all parameters
